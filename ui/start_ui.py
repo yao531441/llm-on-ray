@@ -50,6 +50,13 @@ from pyrecdp.primitives.operations import (
 from pyrecdp.primitives.document.reader import _default_file_readers
 
 
+import logging
+
+lib_list = ["httpcore", "httpx", "paramiko", "urllib3", "markdown_it", "matplotlib"]
+for lib in lib_list:
+    logging.getLogger(lib).setLevel(logging.ERROR)
+
+
 class CustomStopper(Stopper):
     def __init__(self):
         self.should_stop = False
@@ -321,6 +328,79 @@ class ChatBotUI:
         )
         for output in bot_generator:
             yield output
+
+    def bot_sql(
+        self,
+        history,
+        model_endpoint,
+        Max_new_tokens,
+        Temperature,
+        Top_p,
+        Top_k,
+        schema_str,
+        schema_files,
+    ):
+        question = history[-1][0]
+        print("history: ", history)
+        print("question: ", question)
+        schema = schema_str if schema_str else ""
+        if schema_files:
+            for _, file in enumerate(schema_files):
+                with open(file.name, "r") as f:
+                    schema += f.read()
+
+        prompt = """### Instructions:
+        Your task is convert a question into a SQL query, given a MySQL database schema.
+        Adhere to these rules:
+        - **Deliberately go through the question and database schema word by word** to appropriately answer the question
+        - **Use Table Aliases** to prevent ambiguity. For example, `SELECT table1.col1, table2.col1 FROM table1 JOIN table2 ON table1.id = table2.id`.
+        - When creating a ratio, always cast the numerator as float
+        - Use LIKE instead of ilike
+        - Only generate the SQL query, no additional text is required
+        - Generate SQL queries for MySQL database
+
+        ### Input:
+        Generate a SQL query that answers the question `{question}`.
+        This query will run on a database whose schema is represented in this string:
+        {schema}
+
+        ### Response:
+        Based on your instructions, here is the SQL query I have generated to answer the question `{question}`:
+        ```sql
+        """.format(
+            question=question, schema=schema_str
+        )
+
+        prompt = self.process_tool.get_prompt([{"role": "user", "content": prompt}])
+
+        request_url = model_endpoint
+        time_start = time.time()
+        token_num = 0
+        config = {
+            "max_new_tokens": Max_new_tokens,
+            "temperature": Temperature,
+            "do_sample": True,
+            "top_p": Top_p,
+            "top_k": Top_k,
+        }
+        outputs = self.model_generate(prompt=prompt, request_url=request_url, config=config)
+
+        for output in outputs:
+            if len(output) != 0:
+                time_end = time.time()
+                if history[-1][1] is None:
+                    history[-1][1] = output
+                else:
+                    history[-1][1] += output
+                history[-1][1] = self.process_tool.convert_output(history[-1][1])
+                time_spend = round(time_end - time_start, 3)
+                token_num += 1
+                new_token_latency = f"""
+                                    | <!-- --> | <!-- --> |
+                                    |---|---|
+                                    | Total Latency [s] | {time_spend} |
+                                    | Tokens | {token_num} |"""
+                yield [history, new_token_latency]
 
     def regenerate(
         self,
@@ -677,6 +757,7 @@ class ChatBotUI:
 
     def get_ray_cluster(self):
         command = "conda activate " + self.conda_env_name + "; ray status"
+        command = "/root/miniconda3/envs/llm-ray/bin/ray status"
         stdin, stdout, stderr = self.ssh_connect[-1].exec_command(command)
         out = stdout.read().decode("utf-8")
         out_words = [word for word in out.split("\n") if "CPU" in word][0]
@@ -947,7 +1028,7 @@ class ChatBotUI:
 
                 with gr.Accordion("Parameters", open=False, visible=True):
                     replica_num = gr.Slider(
-                        1, 8, 4, step=1, interactive=True, label="Model Replica Number"
+                        1, 8, 1, step=1, interactive=True, label="Model Replica Number"
                     )
                     cpus_per_worker_deploy = gr.Slider(
                         1,
@@ -1246,6 +1327,104 @@ class ChatBotUI:
                         with gr.Column(scale=0.5, min_width=0):
                             clear_btn_rag = gr.Button("Clear")
 
+            with gr.Tab("Text To SQL"):
+                step3 = "Convert natural language questions to SQL queries."
+                gr.HTML("<h3 style='text-align: left; margin-bottom: 1rem'>" + step3 + "</h3>")
+                with gr.Accordion("Configuration", open=False, visible=True):
+                    max_new_tokens_sql = gr.Slider(
+                        1,
+                        2000,
+                        256,
+                        step=1,
+                        interactive=True,
+                        label="Max New Tokens",
+                        info="The maximum numbers of tokens to generate.",
+                    )
+                    Temperature_sql = gr.Slider(
+                        0,
+                        1,
+                        0.5,
+                        step=0.01,
+                        interactive=True,
+                        label="Temperature",
+                        info="The value used to modulate the next token probabilities.",
+                    )
+                    Top_p_sql = gr.Slider(
+                        0,
+                        1,
+                        0.3,
+                        step=0.01,
+                        interactive=True,
+                        label="Top p",
+                        info="If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to`Top p` or higher are kept for generation.",
+                    )
+                    Top_k_sql = gr.Slider(
+                        0,
+                        100,
+                        0,
+                        step=1,
+                        interactive=True,
+                        label="Top k",
+                        info="The number of highest probability vocabulary tokens to keep for top-k-filtering.",
+                    )
+
+                with gr.Row():
+                    default_meta = """CREATE TABLE film_actor (
+actor_id INT NOT NULL,
+film_id  INT NOT NULL,
+last_update TIMESTAMP NOT NULL,
+PRIMARY KEY  (actor_id,film_id),
+CONSTRAINT fk_film_actor_actor FOREIGN KEY (actor_id) REFERENCES actor (actor_id) ON DELETE NO ACTION ON UPDATE CASCADE,
+CONSTRAINT fk_film_actor_film FOREIGN KEY (film_id) REFERENCES film (film_id) ON DELETE NO ACTION ON UPDATE CASCADE
+);"""
+                    metadata_str = gr.Textbox(
+                        value=default_meta,
+                        max_lines=100,
+                        interactive=True,
+                        scale=1,
+                        label="SQL Metadata",
+                    )
+                    metadata_files = gr.File(
+                        label="Upload Metadata File",
+                        file_count="multiple",
+                        file_types=["txt", "sql"],
+                        elem_classes="file_height",
+                        scale=1,
+                    )
+                with gr.Tab("Dialogue"):
+                    chatbot_sql = gr.Chatbot(
+                        elem_id="chatbot",
+                        label="chatbot",
+                        elem_classes="disable_status",
+                    )
+
+                    with gr.Row():
+                        with gr.Column(scale=0.8):
+                            msg_sql = gr.Textbox(
+                                show_label=False,
+                                container=False,
+                                placeholder="Input your question and press Enter",
+                            )
+                        with gr.Column(scale=0.2, min_width=20):
+                            latency_status_sql = gr.Markdown(
+                                """
+                                                | <!-- --> | <!-- --> |
+                                                |---|---|
+                                                | Total Latency [s] | - |
+                                                | Tokens | - |""",
+                                elem_classes=[
+                                    "disable_status",
+                                    "output-stats",
+                                    "disablegenerating",
+                                    "div_height",
+                                ],
+                            )
+                    with gr.Row():
+                        with gr.Column(scale=0.5, min_width=0):
+                            send_btn_sql = gr.Button("Send")
+                        with gr.Column(scale=0.5, min_width=0):
+                            clear_btn_sql = gr.Button("Clear")
+
             with gr.Accordion("Cluster Status", open=False, visible=True):
                 with gr.Row():
                     with gr.Column(scale=0.1, min_width=45):
@@ -1437,6 +1616,24 @@ class ChatBotUI:
                 [chatbot_rag, latency_status_rag],
             )
 
+            clear_btn_sql.click(self.clear, None, [chatbot_sql, latency_status_sql], queue=False)
+            send_btn_sql.click(
+                self.user, [msg_sql, chatbot_sql], [msg_sql, chatbot_sql], queue=False
+            ).then(
+                self.bot_sql,
+                [
+                    chatbot_sql,
+                    deployed_model_endpoint,
+                    max_new_tokens_sql,
+                    Temperature_sql,
+                    Top_p_sql,
+                    Top_k_sql,
+                    metadata_str,
+                    metadata_files,
+                ],
+                [chatbot_sql, latency_status_sql],
+            )
+
             for i in range(self.test_replica):
                 send_all_btn.click(
                     self.user,
@@ -1624,5 +1821,5 @@ if __name__ == "__main__":
         args.master_ip_port,
     )
     ui.gr_chat.queue(concurrency_count=10).launch(
-        share=True, server_port=8080, server_name="0.0.0.0"
+        share=True, server_port=18080, server_name="0.0.0.0"
     )
